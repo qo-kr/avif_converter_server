@@ -19,7 +19,6 @@ fn convert_to_avif(img: &DynamicImage) -> Result<EncodedImage> {
         let rgba = RGBA::new(pixel[0], pixel[1], pixel[2], pixel[3]);
         pixels.push(rgb::RGB::new(rgba.r, rgba.g, rgba.b));
     }
-    //pub fn new(buf: Container, width: usize, height: usize) -> Self
     let buffer = Img::new(
         pixels.as_slice(),
         width.try_into().unwrap(),
@@ -59,8 +58,14 @@ async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) ->
 
     let img = image::load_from_memory(&bytes).expect("Failed to load image");
 
-    let resized_img = if width > 0 && height > 0 {
-        img.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+    let resized_img = if width > 0 || height > 0 {
+        let target_width = if width > 0 { width } else { u32::MAX };
+        let target_height = if height > 0 { height } else { u32::MAX };
+        img.resize(
+            target_width,
+            target_height,
+            image::imageops::FilterType::Lanczos3,
+        )
     } else {
         img
     };
