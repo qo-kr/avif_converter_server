@@ -7,6 +7,10 @@ use rgb::RGB8;
 use std::collections::HashMap;
 use std::io::Cursor;
 
+async fn index() -> impl Responder {
+    HttpResponse::Ok().body("Hello from AVIF converter!")
+}
+
 async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) -> impl Responder {
     let image_url = query.get("url").expect("Image URL is required");
     let width: u32 = query
@@ -114,6 +118,7 @@ async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) ->
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
+            .route("/", web::get().to(index))
             .route("/convert", web::get().to(convert_and_resize_image))
     })
     .bind(("0.0.0.0", 8080))?
