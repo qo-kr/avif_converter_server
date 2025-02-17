@@ -11,6 +11,10 @@ async fn index() -> impl Responder {
     HttpResponse::Ok().body("Hello from AVIF converter!")
 }
 
+async fn health_check() -> impl Responder {
+    HttpResponse::Ok().body("OK")
+}
+
 async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) -> impl Responder {
     let image_url = query.get("url").expect("Image URL is required");
     let width: u32 = query
@@ -119,6 +123,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
             .route("/", web::get().to(index))
+            .route("/up", web::get().to(health_check))
             .route("/convert", web::get().to(convert_and_resize_image))
     })
     .bind(("0.0.0.0", 8080))?
