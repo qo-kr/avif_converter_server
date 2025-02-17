@@ -1,36 +1,11 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use anyhow::Result;
-use image::DynamicImage;
+use exif::{In, Tag};
+use image::{imageops::FilterType, DynamicImage, ImageFormat};
 use ravif::*;
 use reqwest::Client;
-use rgb::RGBA;
+use rgb::RGB8;
 use std::collections::HashMap;
-
-fn convert_to_avif(img: &DynamicImage) -> Result<EncodedImage> {
-    let encoder = ravif::Encoder::new();
-    let _ = encoder.clone().with_quality(80.0);
-    let _ = encoder.clone().with_speed(10);
-    let _ = encoder.with_internal_color_space(ravif::ColorSpace::YCbCr);
-    let rgba_image = img.to_rgba8();
-    let width = rgba_image.width();
-    let height = rgba_image.height();
-    let mut pixels = Vec::with_capacity((width * height).try_into().unwrap());
-    for pixel in rgba_image.pixels() {
-        let rgba = RGBA::new(pixel[0], pixel[1], pixel[2], pixel[3]);
-        pixels.push(rgb::RGB::new(rgba.r, rgba.g, rgba.b));
-    }
-    let buffer = Img::new(
-        pixels.as_slice(),
-        width.try_into().unwrap(),
-        height.try_into().unwrap(),
-    );
-    let encoded_image = ravif::Encoder::new()
-        .with_quality(80.0)
-        .with_speed(10)
-        .with_internal_color_space(ravif::ColorSpace::YCbCr)
-        .encode_rgb(buffer)?;
-    Ok(encoded_image)
-}
+use std::io::Cursor;
 
 async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) -> impl Responder {
     let image_url = query.get("url").expect("Image URL is required");
@@ -56,44 +31,92 @@ async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) ->
         .await
         .expect("Failed to read HTTP response body");
 
-    let img = image::load_from_memory(&bytes).expect("Failed to load image");
+    // EXIF 정보 읽기 및 로깅
+    let mut orientation = 1;
+    if let Ok(exif_reader) = exif::Reader::new().read_from_container(&mut Cursor::new(&bytes)) {
+        if let Some(orientation_field) = exif_reader.get_field(Tag::Orientation, In::PRIMARY) {
+            if let Some(orientation_value) = orientation_field.value.get_uint(0) {
+                orientation = orientation_value as u32;
+                println!("Found EXIF Orientation: {}", orientation);
+            }
+        }
+    }
 
-    let resized_img = if width > 0 || height > 0 {
-        let target_width = if width > 0 { width } else { u32::MAX };
-        let target_height = if height > 0 { height } else { u32::MAX };
-        img.resize(
-            target_width,
-            target_height,
-            image::imageops::FilterType::Lanczos3,
-        )
+    // 이미지 로드
+    let mut img = image::load_from_memory(&bytes).expect("Failed to load image");
+    println!("Original dimensions: {}x{}", img.width(), img.height());
+
+    // EXIF orientation에 따라 이미지 회전
+    img = match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.flipv().rotate90(),
+        6 => img.rotate90(),
+        7 => img.flipv().rotate270(),
+        8 => img.rotate270(),
+        _ => img,
+    };
+
+    // 이미지 크기 조정
+    let img = if width > 0 || height > 0 {
+        let target_width = if width > 0 { width } else { img.width() };
+        let target_height = if height > 0 { height } else { img.height() };
+        
+        // 종횡비 유지하면서 크기 조정
+        let (new_width, new_height) = if width > 0 && height > 0 {
+            (target_width, target_height)
+        } else if width > 0 {
+            let aspect_ratio = img.width() as f32 / img.height() as f32;
+            let new_height = (target_width as f32 / aspect_ratio).round() as u32;
+            (target_width, new_height)
+        } else {
+            let aspect_ratio = img.width() as f32 / img.height() as f32;
+            let new_width = (target_height as f32 * aspect_ratio).round() as u32;
+            (new_width, target_height)
+        };
+
+        img.resize(new_width, new_height, FilterType::Lanczos3)
     } else {
         img
     };
 
-    let avif_img = convert_to_avif(&resized_img).expect("Failed to convert image to AVIF");
+    // AVIF로 변환
+    let rgba = img.to_rgba8();
+    let width = rgba.width() as usize;
+    let height = rgba.height() as usize;
+    let mut pixels = Vec::with_capacity(width * height);
+    
+    for pixel in rgba.pixels() {
+        pixels.push(RGB8::new(pixel[0], pixel[1], pixel[2]));
+    }
+
+    let buffer = Img::new(
+        pixels.as_slice(),
+        width,
+        height,
+    );
+
+    let encoded_image = ravif::Encoder::new()
+        .with_quality(80.0)  // 품질 설정 (0-100)
+        .with_speed(6)       // 속도 설정 (1-10, 높을수록 빠르지만 압축률 감소)
+        .with_alpha_quality(80.0)
+        .with_internal_color_space(ravif::ColorSpace::RGB)
+        .encode_rgb(buffer)
+        .expect("Failed to encode AVIF");
 
     HttpResponse::Ok()
         .content_type("image/avif")
-        .body(avif_img.avif_file)
-}
-
-async fn index() -> impl Responder {
-    HttpResponse::Ok().body(
-        "To convert and resize an image, make a GET request to /convert with the following query parameters: \n\
-        url: The URL of the image to convert. \n\
-        width: The desired width of the image. If not provided, the original width will be used. \n\
-        height: The desired height of the image. If not provided, the original height will be used.",
-    )
+        .body(encoded_image.avif_file)
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
-            .route("/", web::get().to(index))
             .route("/convert", web::get().to(convert_and_resize_image))
     })
-    .bind("0.0.0.0:8080")?
+    .bind(("127.0.0.1", 8080))?
     .run()
     .await
 }
