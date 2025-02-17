@@ -4,6 +4,7 @@
 #
 
 app = "oq-imgcomp"
+org = "genideas"
 primary_region = "nrt"
 
 [build]
