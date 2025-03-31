@@ -20,10 +20,11 @@ primary_region = "nrt"
   auto_start_machines = true
   min_machines_running = 3
   processes = ['app']
+
   [http_service.concurrency]
     type = "requests"
-    hard_limit = 250
-    soft_limit = 200
+    hard_limit = 20
+    soft_limit = 10
 
   [[http_service.checks]]
     interval = "30s"
@@ -37,3 +38,10 @@ primary_region = "nrt"
   cpu_kind = "shared"
   cpus = 2
   memory_mb = 2048
+
+[autoscaling]
+enabled = true
+balance_regions = false
+min_machines_running = 2
+max_machines_running = 20
+scale_factor = 0.8
