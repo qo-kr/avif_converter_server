@@ -1,3 +1,12 @@
-# flyctl launch added from .gitignore
-target
-fly.toml
+# Ignore build artifacts
+/target
+
+# Ignore test output files
+*.avif
+
+# Ignore large image files not needed for the build
+original.jpg
+1758604843316.png
+
+# Ignore git directory
+.git

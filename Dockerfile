@@ -9,26 +9,11 @@ RUN apt-get update && \
 # Set a working directory within the container
 WORKDIR /usr/src/app
 
-# Copy Cargo.toml and Cargo.lock to cache dependencies
-COPY Cargo.toml Cargo.lock ./
-
-# Fetch dependencies
-RUN cargo fetch
-
 # Copy the entire project source code to the container
 COPY . .
 
-# Build the dependencies and application
-#RUN cargo build --release
-#RUN cargo build --release --bin avif_converter_server && ls -al ./target/release
-RUN cargo build --release --bin main && ls -al ./target/release
-
-#RUN ls -al ./target/release
-
-#RUN ls -al ./target/release/avif_converter_server
-
-#RUN chmod +x ./target/release/avif_converter_server
+# Build the application
+RUN cargo build --release
 
 # Specify the command to run your Rust application
-#CMD ["./target/release/avif_converter_server"]
-CMD ["./target/release/main"]
+CMD ["./target/release/oq-imgcomp"]
