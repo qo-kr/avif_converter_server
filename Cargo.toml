@@ -3,19 +3,13 @@ name = "oq-imgcomp"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "main"
-path = "src/main.rs"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-actix-web = "4.4"
-actix-files = "0.6"
-actix-multipart = "0.6"
-futures = "0.3"
-tokio = { version = "1", features = ["full", "sync"] }
-anyhow = "1.0"
-image = { version = "0.24" }
-kamadak-exif = "0.5"
-reqwest = { version = "0.11", features = ["json"] }
-ravif = "0.11.4"
-rgb = "0.8.37"
+actix-web = "4"
+reqwest = "0.11"
+image = "0.24.2"
+ravif = "0.11.2"
+rgb = "0.8.36"
+bytes = "1.1.0"
+exif = { version = "0.5.5", package = "kamadak-exif" }
