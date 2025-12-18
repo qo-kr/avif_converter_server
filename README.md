@@ -38,16 +38,36 @@ By default, the service will bind to `0.0.0.0:8080`. You can change the binding 
 To convert and resize an image, make a GET request to `/convert` with the following query parameters:
 
 - `url`: The URL of the image to convert.
-- `width`: The desired width of the image. If not provided, the original width will be used.
-- `height`: The desired height of the image. If not provided, the original height will be used.
+- `width`: (Optional) The desired width of the image.
+- `height`: (Optional) The desired height of the image.
+- `fit`: (Optional) The resize mode. Options are `contain`, `cover`, `fill`.
+  - `contain`: Preserves aspect ratio and adds padding if necessary to fit the dimensions. (Recommended for fixed sizes like 1280x960)
+  - `cover`: Preserves aspect ratio and crops the image to fill the dimensions.
+  - `fill`: Stretches the image to fill the dimensions (aspect ratio may be broken).
+  - If omitted, default behavior is resizing to fit within dimensions (similar to `contain` but without padding).
+- `bg`: (Optional) Background color for `contain` mode padding.
+  - Named colors: `white`, `black`, `gray`.
+  - Hex code: e.g., `ff0000` (for red).
+  - Default is transparent.
+- `pattern`: (Optional) URL of an image to use as a background pattern for `contain` mode padding.
+- `quality`: (Optional) AVIF compression quality (1-100). Default is 80.
 
-Example:
+### Examples
 
+**Basic Resize:**
 ```bash
 curl "http://localhost:8080/convert?url=https://example.com/image.jpg&width=300&height=200"
 ```
 
-This will convert the image at the specified URL to AVIF format, resize it to the specified dimensions (if provided), and return the converted image.
+**Fixed Size with White Padding (1280x960):**
+```bash
+curl "http://localhost:8080/convert?url=https://example.com/image.jpg&width=1280&height=960&fit=contain&bg=white"
+```
+
+**Fixed Size with Pattern Background:**
+```bash
+curl "http://localhost:8080/convert?url=https://example.com/image.jpg&width=1280&height=960&fit=contain&pattern=https://example.com/pattern.png"
+```
 
 ## Dependencies
 
