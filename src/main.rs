@@ -15,6 +15,12 @@ enum ResizeFit {
     Fill,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CropUnit {
+    Pixels,
+    Normalized,
+}
+
 impl FromStr for ResizeFit {
     type Err = ();
 
@@ -28,6 +34,27 @@ impl FromStr for ResizeFit {
     }
 }
 
+impl FromStr for CropUnit {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "px" | "pixel" | "pixels" => Ok(CropUnit::Pixels),
+            "norm" | "normalized" | "ratio" => Ok(CropUnit::Normalized),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CropInput {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    unit: CropUnit,
+}
+
 #[derive(Debug, Clone)]
 struct ResizeOptions {
     width: u32,
@@ -36,6 +63,7 @@ struct ResizeOptions {
     bg: Option<String>,
     quality: f32,
     pattern_data: Option<Vec<u8>>,
+    crop: Option<CropInput>,
 }
 
 impl Default for ResizeOptions {
@@ -47,6 +75,7 @@ impl Default for ResizeOptions {
             bg: None,
             quality: 80.0,
             pattern_data: None,
+            crop: None,
         }
     }
 }
@@ -69,6 +98,88 @@ fn parse_hex_color(hex: &str) -> Option<Rgba<u8>> {
     } else {
         None
     }
+}
+
+fn parse_bbox_values(query: &HashMap<String, String>) -> Result<Option<(f32, f32, f32, f32)>, String> {
+    if let Some(bbox) = query.get("bbox") {
+        let parts: Vec<&str> = bbox.split(',').map(|s| s.trim()).collect();
+        if parts.len() != 4 {
+            return Err("Invalid bbox format. Expected: x,y,w,h".to_string());
+        }
+        let x = parts[0].parse::<f32>().map_err(|_| "Invalid bbox value".to_string())?;
+        let y = parts[1].parse::<f32>().map_err(|_| "Invalid bbox value".to_string())?;
+        let w = parts[2].parse::<f32>().map_err(|_| "Invalid bbox value".to_string())?;
+        let h = parts[3].parse::<f32>().map_err(|_| "Invalid bbox value".to_string())?;
+        return Ok(Some((x, y, w, h)));
+    }
+
+    let has_any = query.contains_key("bbox_x")
+        || query.contains_key("bbox_y")
+        || query.contains_key("bbox_w")
+        || query.contains_key("bbox_h")
+        || query.contains_key("bbox_width")
+        || query.contains_key("bbox_height");
+    if !has_any {
+        return Ok(None);
+    }
+
+    let x = query.get("bbox_x").ok_or("bbox_x is required when using bbox_* params")?;
+    let y = query.get("bbox_y").ok_or("bbox_y is required when using bbox_* params")?;
+    let w = query
+        .get("bbox_w")
+        .or_else(|| query.get("bbox_width"))
+        .ok_or("bbox_w (or bbox_width) is required when using bbox_* params")?;
+    let h = query
+        .get("bbox_h")
+        .or_else(|| query.get("bbox_height"))
+        .ok_or("bbox_h (or bbox_height) is required when using bbox_* params")?;
+
+    let x = x.parse::<f32>().map_err(|_| "Invalid bbox_x value".to_string())?;
+    let y = y.parse::<f32>().map_err(|_| "Invalid bbox_y value".to_string())?;
+    let w = w.parse::<f32>().map_err(|_| "Invalid bbox_w value".to_string())?;
+    let h = h.parse::<f32>().map_err(|_| "Invalid bbox_h value".to_string())?;
+
+    Ok(Some((x, y, w, h)))
+}
+
+fn clamp_crop_rect(img_width: u32, img_height: u32, crop: CropInput) -> Option<(u32, u32, u32, u32)> {
+    if img_width == 0 || img_height == 0 {
+        return None;
+    }
+
+    let (x, y, w, h) = match crop.unit {
+        CropUnit::Pixels => (crop.x, crop.y, crop.width, crop.height),
+        CropUnit::Normalized => (
+            crop.x * img_width as f32,
+            crop.y * img_height as f32,
+            crop.width * img_width as f32,
+            crop.height * img_height as f32,
+        ),
+    };
+
+    let x = x.round() as i64;
+    let y = y.round() as i64;
+    let w = w.round() as i64;
+    let h = h.round() as i64;
+
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+
+    let img_w = img_width as i64;
+    let img_h = img_height as i64;
+    let x1 = x.clamp(0, img_w);
+    let y1 = y.clamp(0, img_h);
+    let x2 = (x1 + w).clamp(x1, img_w);
+    let y2 = (y1 + h).clamp(y1, img_h);
+
+    let out_w = (x2 - x1) as u32;
+    let out_h = (y2 - y1) as u32;
+    if out_w == 0 || out_h == 0 {
+        return None;
+    }
+
+    Some((x1 as u32, y1 as u32, out_w, out_h))
 }
 
 fn create_background(width: u32, height: u32, bg_str: Option<&str>, pattern_data: Option<&[u8]>) -> DynamicImage {
@@ -127,6 +238,12 @@ fn process_image_bytes(bytes: &bytes::Bytes, options: &ResizeOptions) -> Result<
         8 => img.rotate270(),
         _ => img,
     };
+
+    if let Some(crop) = options.crop {
+        if let Some((x, y, width, height)) = clamp_crop_rect(img.width(), img.height(), crop) {
+            img = img.crop_imm(x, y, width, height);
+        }
+    }
 
     // Resize logic
     let final_img = if options.width > 0 || options.height > 0 {
@@ -228,6 +345,28 @@ async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) ->
     let quality: f32 = query.get("quality").and_then(|v| v.parse().ok()).unwrap_or(80.0);
     
     let pattern_url = query.get("pattern");
+    let crop_values = match parse_bbox_values(&query) {
+        Ok(values) => values,
+        Err(e) => return HttpResponse::BadRequest().body(e),
+    };
+    let crop = if let Some((x, y, w, h)) = crop_values {
+        let unit = match query.get("bbox_unit") {
+            Some(value) => match CropUnit::from_str(value) {
+                Ok(unit) => unit,
+                Err(_) => return HttpResponse::BadRequest().body("Invalid bbox_unit. Use px or norm"),
+            },
+            None => CropUnit::Pixels,
+        };
+        Some(CropInput {
+            x,
+            y,
+            width: w,
+            height: h,
+            unit,
+        })
+    } else {
+        None
+    };
 
     let client = Client::new();
     
@@ -258,6 +397,7 @@ async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) ->
         bg,
         quality,
         pattern_data,
+        crop,
     };
 
     match process_image_bytes(&bytes, &options) {
@@ -285,8 +425,8 @@ async fn main() -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::collections::HashMap;
     use bytes::Bytes;
-    use image::GenericImageView;
 
     struct ImageSize<'a> {
         width: u32,
@@ -342,6 +482,68 @@ mod tests {
         let mut cursor = Cursor::new(Vec::new());
         img.write_to(&mut cursor, image::ImageOutputFormat::Png).unwrap();
         cursor.into_inner()
+    }
+
+    #[test]
+    fn test_clamp_crop_rect_pixels_clamps_to_bounds() {
+        let crop = CropInput {
+            x: -10.0,
+            y: 10.0,
+            width: 50.0,
+            height: 100.0,
+            unit: CropUnit::Pixels,
+        };
+        let rect = clamp_crop_rect(100, 80, crop).expect("Expected clamped rect");
+        assert_eq!(rect, (0, 10, 50, 70));
+    }
+
+    #[test]
+    fn test_clamp_crop_rect_normalized() {
+        let crop = CropInput {
+            x: 0.25,
+            y: 0.1,
+            width: 0.5,
+            height: 0.5,
+            unit: CropUnit::Normalized,
+        };
+        let rect = clamp_crop_rect(200, 100, crop).expect("Expected rect");
+        assert_eq!(rect, (50, 10, 100, 50));
+    }
+
+    #[test]
+    fn test_clamp_crop_rect_empty_returns_none() {
+        let crop = CropInput {
+            x: 200.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+            unit: CropUnit::Pixels,
+        };
+        assert!(clamp_crop_rect(100, 100, crop).is_none());
+        let crop = CropInput {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 10.0,
+            unit: CropUnit::Pixels,
+        };
+        assert!(clamp_crop_rect(100, 100, crop).is_none());
+    }
+
+    #[test]
+    fn test_parse_bbox_values() {
+        let mut query = HashMap::new();
+        query.insert("bbox".to_string(), "1,2,3,4".to_string());
+        let parsed = parse_bbox_values(&query).expect("Expected parse");
+        assert_eq!(parsed, Some((1.0, 2.0, 3.0, 4.0)));
+
+        let mut query = HashMap::new();
+        query.insert("bbox_x".to_string(), "10".to_string());
+        query.insert("bbox_y".to_string(), "20".to_string());
+        query.insert("bbox_w".to_string(), "30".to_string());
+        query.insert("bbox_h".to_string(), "40".to_string());
+        let parsed = parse_bbox_values(&query).expect("Expected parse");
+        assert_eq!(parsed, Some((10.0, 20.0, 30.0, 40.0)));
     }
 
     #[test]

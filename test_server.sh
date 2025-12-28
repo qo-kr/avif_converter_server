@@ -74,4 +74,9 @@ else
     echo "⚠️ Skipping Pattern Test: pattern_checker.png not found"
 fi
 
+# 8. BBox Crop (Normalized)
+echo "Test 8: BBox Crop (Normalized)"
+curl -s "http://localhost:8080/convert?url=http://localhost:8081/original.jpg&bbox=0,0.0992,0.5291,0.7440&bbox_unit=norm&width=800&height=600&fit=contain&bg=white" -o integration_test_bbox_norm.avif
+check_file "integration_test_bbox_norm.avif"
+
 echo "All integration tests completed successfully!"

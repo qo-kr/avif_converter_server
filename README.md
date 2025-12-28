@@ -40,6 +40,9 @@ To convert and resize an image, make a GET request to `/convert` with the follow
 - `url`: The URL of the image to convert.
 - `width`: (Optional) The desired width of the image.
 - `height`: (Optional) The desired height of the image.
+- `bbox`: (Optional) Crop rectangle applied before resizing (after EXIF orientation correction). Format: `x,y,w,h`.
+- `bbox_unit`: (Optional) Unit for `bbox` values: `px` (default) or `norm` (0..1 relative to the EXIF-corrected image size). Out-of-range values are clamped to image bounds; empty results are ignored.
+- `bbox_x`, `bbox_y`, `bbox_w`, `bbox_h`: (Optional) Alternative to `bbox` for separate parameters.
 - `fit`: (Optional) The resize mode. Options are `contain`, `cover`, `fill`.
   - `contain`: Preserves aspect ratio and adds padding if necessary to fit the dimensions. (Recommended for fixed sizes like 1280x960)
   - `cover`: Preserves aspect ratio and crops the image to fill the dimensions.
@@ -64,10 +67,30 @@ curl "http://localhost:8080/convert?url=https://example.com/image.jpg&width=300&
 curl "http://localhost:8080/convert?url=https://example.com/image.jpg&width=1280&height=960&fit=contain&bg=white"
 ```
 
+**Crop with Pixel BBox then Contain:**
+```bash
+curl "http://localhost:8080/convert?url=https://example.com/image.jpg&bbox=100,50,400,300&width=800&height=600&fit=contain&bg=white"
+```
+
+**Crop with Normalized BBox (0..1) then Cover:**
+```bash
+curl "http://localhost:8080/convert?url=https://example.com/image.jpg&bbox=0.1,0.1,0.8,0.8&bbox_unit=norm&width=600&height=600&fit=cover"
+```
+
 **Fixed Size with Pattern Background:**
 ```bash
 curl "http://localhost:8080/convert?url=https://example.com/image.jpg&width=1280&height=960&fit=contain&pattern=https://example.com/pattern.png"
 ```
+
+## Testing
+
+Run the integration test script to spin up a local image server and the API, then execute sample requests (including bbox crop):
+
+```bash
+./test_server.sh
+```
+
+The script expects `original.jpg` to be present in the project root and will reuse `pattern_checker.png` if available.
 
 ## Dependencies
 
