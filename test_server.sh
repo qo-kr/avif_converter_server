@@ -79,4 +79,19 @@ echo "Test 8: BBox Crop (Normalized)"
 curl -s "http://localhost:8080/convert?url=http://localhost:8081/original.jpg&bbox=0,0.0992,0.5291,0.7440&bbox_unit=norm&width=800&height=600&fit=contain&bg=white" -o integration_test_bbox_norm.avif
 check_file "integration_test_bbox_norm.avif"
 
+# 9. Force JPEG Output
+echo "Test 9: Force JPEG Output"
+curl -s "http://localhost:8080/convert?url=http://localhost:8081/original.jpg&width=640&height=480&ext=jpg" -o integration_test_ext.jpg
+check_file "integration_test_ext.jpg"
+
+# 10. Force PNG Output
+echo "Test 10: Force PNG Output"
+curl -s "http://localhost:8080/convert?url=http://localhost:8081/original.jpg&width=640&height=480&ext=png" -o integration_test_ext.png
+check_file "integration_test_ext.png"
+
+# 11. Accept Header PNG
+echo "Test 11: Accept Header PNG"
+curl -s -H "Accept: image/png" "http://localhost:8080/convert?url=http://localhost:8081/original.jpg&width=640&height=480" -o integration_test_accept_png.png
+check_file "integration_test_accept_png.png"
+
 echo "All integration tests completed successfully!"

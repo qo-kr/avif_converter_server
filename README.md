@@ -53,7 +53,14 @@ To convert and resize an image, make a GET request to `/convert` with the follow
   - Hex code: e.g., `ff0000` (for red).
   - Default is transparent.
 - `pattern`: (Optional) URL of an image to use as a background pattern for `contain` mode padding.
-- `quality`: (Optional) AVIF compression quality (1-100). Default is 80.
+- `ext`: (Optional) Output format. Options: `avif` (default), `jpg`, `jpeg`, `png`. Overrides the `Accept` header.
+- `quality`: (Optional) Quality setting (1-100). Default is 80.
+  - AVIF/JPEG: higher is better quality and larger output.
+  - PNG: treated as a compression hint (<=40 fast, <=85 default, >85 best).
+
+**Format selection notes:**
+- If `ext` is omitted, the server checks the `Accept` header for exact `image/avif`, `image/jpeg`, or `image/png` tokens (parameters like `q` are ignored). If multiple match, the server prefers AVIF > JPEG > PNG.
+- JPEG does not support alpha. If the result has transparency and `ext=jpg|jpeg`, provide `bg` to flatten; otherwise the server returns PNG to preserve alpha.
 
 ### Examples
 
@@ -80,6 +87,21 @@ curl "http://localhost:8080/convert?url=https://example.com/image.jpg&bbox=0.1,0
 **Fixed Size with Pattern Background:**
 ```bash
 curl "http://localhost:8080/convert?url=https://example.com/image.jpg&width=1280&height=960&fit=contain&pattern=https://example.com/pattern.png"
+```
+
+**Force JPEG Output:**
+```bash
+curl "http://localhost:8080/convert?url=https://example.com/image.jpg&width=800&height=600&ext=jpg"
+```
+
+**Force PNG Output:**
+```bash
+curl "http://localhost:8080/convert?url=https://example.com/image.jpg&width=800&height=600&ext=png"
+```
+
+**Use Accept Header (no ext):**
+```bash
+curl -H "Accept: image/png" "http://localhost:8080/convert?url=https://example.com/image.jpg&width=800&height=600"
 ```
 
 ## Testing

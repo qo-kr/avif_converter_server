@@ -1,6 +1,9 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use exif::{In, Tag};
-use image::{imageops::{self, FilterType}, DynamicImage, GenericImageView, Rgba, RgbaImage};
+use image::codecs::jpeg::JpegEncoder;
+use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
+use image::ImageEncoder;
+use image::{imageops::{self, FilterType}, ColorType, DynamicImage, GenericImageView, Rgba, RgbaImage};
 use ravif::*;
 use reqwest::Client;
 use rgb::{RGB8, RGBA8};
@@ -19,6 +22,23 @@ enum ResizeFit {
 enum CropUnit {
     Pixels,
     Normalized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OutputFormat {
+    Avif,
+    Jpeg,
+    Png,
+}
+
+impl OutputFormat {
+    fn content_type(self) -> &'static str {
+        match self {
+            OutputFormat::Avif => "image/avif",
+            OutputFormat::Jpeg => "image/jpeg",
+            OutputFormat::Png => "image/png",
+        }
+    }
 }
 
 impl FromStr for ResizeFit {
@@ -43,6 +63,65 @@ impl FromStr for CropUnit {
             "norm" | "normalized" | "ratio" => Ok(CropUnit::Normalized),
             _ => Err(()),
         }
+    }
+}
+
+fn parse_output_format_ext(value: &str) -> Option<OutputFormat> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("avif") {
+        Some(OutputFormat::Avif)
+    } else if value.eq_ignore_ascii_case("jpg") || value.eq_ignore_ascii_case("jpeg") {
+        Some(OutputFormat::Jpeg)
+    } else if value.eq_ignore_ascii_case("png") {
+        Some(OutputFormat::Png)
+    } else {
+        None
+    }
+}
+
+fn output_format_from_accept_header(value: &str) -> Option<OutputFormat> {
+    let mut has_avif = false;
+    let mut has_jpeg = false;
+    let mut has_png = false;
+
+    for part in value.split(',') {
+        let mime = part.split(';').next().unwrap_or("").trim();
+        if mime.eq_ignore_ascii_case("image/avif") {
+            has_avif = true;
+        } else if mime.eq_ignore_ascii_case("image/jpeg") || mime.eq_ignore_ascii_case("image/jpg") {
+            has_jpeg = true;
+        } else if mime.eq_ignore_ascii_case("image/png") {
+            has_png = true;
+        }
+    }
+
+    if has_avif {
+        Some(OutputFormat::Avif)
+    } else if has_jpeg {
+        Some(OutputFormat::Jpeg)
+    } else if has_png {
+        Some(OutputFormat::Png)
+    } else {
+        None
+    }
+}
+
+fn clamp_quality(quality: f32) -> f32 {
+    quality.clamp(1.0, 100.0)
+}
+
+fn quality_to_u8(quality: f32) -> u8 {
+    clamp_quality(quality).round() as u8
+}
+
+fn png_compression_from_quality(quality: f32) -> CompressionType {
+    let q = clamp_quality(quality);
+    if q <= 40.0 {
+        CompressionType::Fast
+    } else if q <= 85.0 {
+        CompressionType::Default
+    } else {
+        CompressionType::Best
     }
 }
 
@@ -97,6 +176,16 @@ fn parse_hex_color(hex: &str) -> Option<Rgba<u8>> {
         Some(Rgba([r, g, b, 255]))
     } else {
         None
+    }
+}
+
+fn resolve_bg_color(bg_str: Option<&str>) -> Option<Rgba<u8>> {
+    match bg_str {
+        Some("white") => Some(Rgba([255, 255, 255, 255])),
+        Some("black") => Some(Rgba([0, 0, 0, 255])),
+        Some("gray") => Some(Rgba([128, 128, 128, 255])),
+        Some(hex) => parse_hex_color(hex),
+        None => None,
     }
 }
 
@@ -199,19 +288,19 @@ fn create_background(width: u32, height: u32, bg_str: Option<&str>, pattern_data
         }
     }
 
-    let color = match bg_str {
-        Some("white") => Rgba([255, 255, 255, 255]),
-        Some("black") => Rgba([0, 0, 0, 255]),
-        Some("gray") => Rgba([128, 128, 128, 255]),
-        Some(hex) => parse_hex_color(hex).unwrap_or(Rgba([0, 0, 0, 0])), // Default to transparent if invalid
-        None => Rgba([0, 0, 0, 0]), // Transparent
-    };
+    let color = resolve_bg_color(bg_str).unwrap_or(Rgba([0, 0, 0, 0]));
 
     DynamicImage::ImageRgba8(RgbaImage::from_pixel(width, height, color))
 }
 
+fn flatten_with_bg(img: &DynamicImage, bg_color: Rgba<u8>) -> DynamicImage {
+    let mut bg_img = RgbaImage::from_pixel(img.width(), img.height(), bg_color);
+    imageops::overlay(&mut bg_img, &img.to_rgba8(), 0, 0);
+    DynamicImage::ImageRgba8(bg_img)
+}
+
 // Core image processing logic extracted into a separate function
-fn process_image_bytes(bytes: &bytes::Bytes, options: &ResizeOptions) -> Result<ravif::EncodedImage, String> {
+fn process_image_bytes(bytes: &bytes::Bytes, options: &ResizeOptions) -> Result<DynamicImage, String> {
     // Read and log EXIF information
     let mut orientation = 1;
     if let Ok(exif_reader) = exif::Reader::new().read_from_container(&mut Cursor::new(bytes)) {
@@ -298,19 +387,21 @@ fn process_image_bytes(bytes: &bytes::Bytes, options: &ResizeOptions) -> Result<
         img
     };
 
-    // Convert to AVIF based on color type
-    let has_alpha = final_img.color().has_alpha();
-    
-    let encoder = ravif::Encoder::new()
-        .with_quality(options.quality)
-        .with_speed(6)
-        .with_alpha_quality(options.quality);
+    Ok(final_img)
+}
 
-    if has_alpha {
+fn encode_avif_image(final_img: &DynamicImage, quality: f32) -> Result<Vec<u8>, String> {
+    let has_alpha = final_img.color().has_alpha();
+    let encoder = ravif::Encoder::new()
+        .with_quality(clamp_quality(quality))
+        .with_speed(6)
+        .with_alpha_quality(clamp_quality(quality));
+
+    let encoded = if has_alpha {
         let rgba_image = final_img.to_rgba8();
         let width = rgba_image.width() as usize;
         let height = rgba_image.height() as usize;
-        
+
         let mut pixels = Vec::with_capacity(width * height);
         for pixel in rgba_image.pixels() {
             pixels.push(RGBA8::new(pixel[0], pixel[1], pixel[2], pixel[3]));
@@ -328,13 +419,109 @@ fn process_image_bytes(bytes: &bytes::Bytes, options: &ResizeOptions) -> Result<
         }
         let buffer = Img::new(pixels.as_slice(), width, height);
         encoder.encode_rgb(buffer)
-    }.map_err(|e| format!("Failed to encode AVIF: {}", e))
+    }
+    .map_err(|e| format!("Failed to encode AVIF: {}", e))?;
+
+    Ok(encoded.avif_file)
 }
 
-async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) -> impl Responder {
+fn encode_jpeg_image(final_img: &DynamicImage, quality: f32) -> Result<Vec<u8>, String> {
+    let rgb_image = final_img.to_rgb8();
+    let mut buf = Vec::new();
+    let encoder = JpegEncoder::new_with_quality(&mut buf, quality_to_u8(quality));
+    encoder
+        .write_image(
+            rgb_image.as_raw(),
+            rgb_image.width(),
+            rgb_image.height(),
+            ColorType::Rgb8,
+        )
+        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+    Ok(buf)
+}
+
+fn encode_png_image(final_img: &DynamicImage, quality: f32) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let encoder = PngEncoder::new_with_quality(
+        &mut buf,
+        png_compression_from_quality(quality),
+        PngFilterType::Adaptive,
+    );
+
+    if final_img.color().has_alpha() {
+        let rgba_image = final_img.to_rgba8();
+        encoder
+            .write_image(
+                rgba_image.as_raw(),
+                rgba_image.width(),
+                rgba_image.height(),
+                ColorType::Rgba8,
+            )
+            .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+    } else {
+        let rgb_image = final_img.to_rgb8();
+        encoder
+            .write_image(
+                rgb_image.as_raw(),
+                rgb_image.width(),
+                rgb_image.height(),
+                ColorType::Rgb8,
+            )
+            .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+    }
+
+    Ok(buf)
+}
+
+fn encode_output_image(
+    final_img: &DynamicImage,
+    output_format: OutputFormat,
+    quality: f32,
+    bg_color: Option<Rgba<u8>>,
+) -> Result<(Vec<u8>, OutputFormat), String> {
+    let mut format = output_format;
+    let flattened = if format == OutputFormat::Jpeg && final_img.color().has_alpha() {
+        if let Some(color) = bg_color {
+            Some(flatten_with_bg(final_img, color))
+        } else {
+            format = OutputFormat::Png;
+            None
+        }
+    } else {
+        None
+    };
+
+    let img_ref = flattened.as_ref().unwrap_or(final_img);
+
+    let encoded = match format {
+        OutputFormat::Avif => encode_avif_image(img_ref, quality)?,
+        OutputFormat::Jpeg => encode_jpeg_image(img_ref, quality)?,
+        OutputFormat::Png => encode_png_image(img_ref, quality)?,
+    };
+
+    Ok((encoded, format))
+}
+
+async fn convert_and_resize_image(req: HttpRequest, query: web::Query<HashMap<String, String>>) -> impl Responder {
     let image_url = match query.get("url") {
         Some(url) => url,
         None => return HttpResponse::BadRequest().body("Image URL is required"),
+    };
+
+    let output_format = if let Some(ext) = query.get("ext") {
+        match parse_output_format_ext(ext) {
+            Some(format) => format,
+            None => {
+                return HttpResponse::BadRequest()
+                    .body("Invalid ext. Use avif, jpg, jpeg, or png");
+            }
+        }
+    } else {
+        req.headers()
+            .get("Accept")
+            .and_then(|value| value.to_str().ok())
+            .and_then(output_format_from_accept_header)
+            .unwrap_or(OutputFormat::Avif)
     };
 
     let width: u32 = query.get("width").and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -343,6 +530,7 @@ async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) ->
     let fit = query.get("fit").and_then(|v| ResizeFit::from_str(v).ok());
     let bg = query.get("bg").cloned();
     let quality: f32 = query.get("quality").and_then(|v| v.parse().ok()).unwrap_or(80.0);
+    let quality = clamp_quality(quality);
     
     let pattern_url = query.get("pattern");
     let crop_values = match parse_bbox_values(&query) {
@@ -400,10 +588,14 @@ async fn convert_and_resize_image(query: web::Query<HashMap<String, String>>) ->
         crop,
     };
 
+    let bg_color = resolve_bg_color(options.bg.as_deref());
     match process_image_bytes(&bytes, &options) {
-        Ok(encoded_image) => HttpResponse::Ok()
-            .content_type("image/avif")
-            .body(encoded_image.avif_file),
+        Ok(final_img) => match encode_output_image(&final_img, output_format, options.quality, bg_color) {
+            Ok((encoded_image, actual_format)) => HttpResponse::Ok()
+                .content_type(actual_format.content_type())
+                .body(encoded_image),
+            Err(e) => HttpResponse::InternalServerError().body(e),
+        },
         Err(e) => HttpResponse::InternalServerError().body(e),
     }
 }
@@ -547,6 +739,78 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_output_format_ext() {
+        assert_eq!(parse_output_format_ext("avif"), Some(OutputFormat::Avif));
+        assert_eq!(parse_output_format_ext("jpg"), Some(OutputFormat::Jpeg));
+        assert_eq!(parse_output_format_ext("jpeg"), Some(OutputFormat::Jpeg));
+        assert_eq!(parse_output_format_ext("PNG"), Some(OutputFormat::Png));
+        assert_eq!(parse_output_format_ext("gif"), None);
+    }
+
+    #[test]
+    fn test_output_format_from_accept_header_exact_matching() {
+        assert_eq!(
+            output_format_from_accept_header("image/jpeg, image/avif"),
+            Some(OutputFormat::Avif)
+        );
+        assert_eq!(
+            output_format_from_accept_header("text/plain, image/png; q=0.5"),
+            Some(OutputFormat::Png)
+        );
+        assert_eq!(
+            output_format_from_accept_header("image/png, image/jpeg"),
+            Some(OutputFormat::Jpeg)
+        );
+        assert_eq!(
+            output_format_from_accept_header("image/avif;q=0.8"),
+            Some(OutputFormat::Avif)
+        );
+        assert_eq!(output_format_from_accept_header("image/webp"), None);
+        assert_eq!(output_format_from_accept_header("image/*"), None);
+    }
+
+    #[test]
+    fn test_png_compression_from_quality() {
+        assert_eq!(png_compression_from_quality(1.0), CompressionType::Fast);
+        assert_eq!(png_compression_from_quality(40.0), CompressionType::Fast);
+        assert_eq!(png_compression_from_quality(41.0), CompressionType::Default);
+        assert_eq!(png_compression_from_quality(85.0), CompressionType::Default);
+        assert_eq!(png_compression_from_quality(86.0), CompressionType::Best);
+        assert_eq!(png_compression_from_quality(100.0), CompressionType::Best);
+    }
+
+    #[test]
+    fn test_encode_output_image_jpeg_alpha_falls_back_to_png() {
+        let mut img = RgbaImage::new(2, 2);
+        img.put_pixel(0, 0, Rgba([255, 0, 0, 0]));
+        let dyn_img = DynamicImage::ImageRgba8(img);
+
+        let (bytes, format) = encode_output_image(&dyn_img, OutputFormat::Jpeg, 80.0, None)
+            .expect("Failed to encode image");
+        assert_eq!(format, OutputFormat::Png);
+        assert!(bytes.len() >= 8);
+        assert_eq!(&bytes[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+    }
+
+    #[test]
+    fn test_encode_output_image_jpeg_with_bg() {
+        let mut img = RgbaImage::new(2, 2);
+        img.put_pixel(0, 0, Rgba([255, 0, 0, 0]));
+        let dyn_img = DynamicImage::ImageRgba8(img);
+
+        let (bytes, format) = encode_output_image(
+            &dyn_img,
+            OutputFormat::Jpeg,
+            80.0,
+            Some(Rgba([255, 255, 255, 255])),
+        )
+        .expect("Failed to encode image");
+        assert_eq!(format, OutputFormat::Jpeg);
+        assert!(bytes.len() >= 2);
+        assert_eq!(&bytes[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
     fn test_image_conversion_with_alpha() {
         let image_path = "1758604843316.png";
         // Ensure test file exists or skip if running in CI without it
@@ -570,12 +834,13 @@ mod tests {
                 height: size.height,
                 ..Default::default()
             };
-            let result = process_image_bytes(&image_bytes, &options);
-            assert!(result.is_ok(), "Failed to process image with alpha");
-            let encoded_image = result.unwrap();
+            let final_img = process_image_bytes(&image_bytes, &options)
+                .expect("Failed to process image with alpha");
+            let encoded_image = encode_avif_image(&final_img, options.quality)
+                .expect("Failed to encode AVIF");
             
             let output_filename = format!("test_output_png_{}.avif", size.name);
-            fs::write(&output_filename, encoded_image.avif_file)
+            fs::write(&output_filename, encoded_image)
                 .expect(&format!("Failed to write output file: {}", output_filename));
             
             println!("Successfully generated {}", output_filename);
@@ -603,12 +868,13 @@ mod tests {
                 height: size.height,
                 ..Default::default()
             };
-            let result = process_image_bytes(&image_bytes, &options);
-            assert!(result.is_ok(), "Failed to process image without alpha");
-            let encoded_image = result.unwrap();
+            let final_img = process_image_bytes(&image_bytes, &options)
+                .expect("Failed to process image without alpha");
+            let encoded_image = encode_avif_image(&final_img, options.quality)
+                .expect("Failed to encode AVIF");
             
             let output_filename = format!("test_output_jpg_{}.avif", size.name);
-            fs::write(&output_filename, encoded_image.avif_file)
+            fs::write(&output_filename, encoded_image)
                 .expect(&format!("Failed to write output file: {}", output_filename));
             
             println!("Successfully generated {}", output_filename);
@@ -635,17 +901,16 @@ mod tests {
             ..Default::default()
         };
         
-        let result = process_image_bytes(&bytes, &options).expect("Failed to process");
+        let final_img = process_image_bytes(&bytes, &options).expect("Failed to process");
+        let encoded_image = encode_avif_image(&final_img, options.quality)
+            .expect("Failed to encode AVIF");
         
-        // Verify output dimensions by decoding the result (AVIF decoding might be tricky without a decoder lib, 
-        // but here we trust the process_image_bytes returns valid AVIF if it didn't error.
-        // Ideally we would decode and check pixels, but ravif is encoder-only in this context.
-        // We will assume if it runs without error and produces bytes, logic worked.
-        // To be safer, we can check the intermediate DynamicImage logic by unit testing helper functions if needed,
-        // but integration test here is fine.)
+        // Verify output dimensions by decoding the result (AVIF decoding might be tricky without a decoder lib,
+        // so we assert that encoding succeeds and returns bytes.
+        // To be safer, we can check the intermediate DynamicImage logic by unit testing helper functions if needed.)
         
-        assert!(!result.avif_file.is_empty());
-        println!("Generated padded AVIF size: {} bytes", result.avif_file.len());
+        assert!(!encoded_image.is_empty());
+        println!("Generated padded AVIF size: {} bytes", encoded_image.len());
     }
 
     #[test]
@@ -667,8 +932,10 @@ mod tests {
             ..Default::default()
         };
         
-        let result = process_image_bytes(&bytes, &options).expect("Failed to process cover");
-        assert!(!result.avif_file.is_empty());
+        let final_img = process_image_bytes(&bytes, &options).expect("Failed to process cover");
+        let encoded_image = encode_avif_image(&final_img, options.quality)
+            .expect("Failed to encode AVIF");
+        assert!(!encoded_image.is_empty());
     }
 
     #[test]
@@ -689,7 +956,8 @@ mod tests {
             ..Default::default()
         };
         let res_white = process_image_bytes(&image_bytes, &opts_white).expect("Failed white");
-        fs::write("visual_test_contain_white.avif", res_white.avif_file).expect("Write failed");
+        let avif_white = encode_avif_image(&res_white, opts_white.quality).expect("Failed to encode AVIF");
+        fs::write("visual_test_contain_white.avif", avif_white).expect("Write failed");
         println!("Generated visual_test_contain_white.avif");
 
         // Case 2: 1280x960, Contain, Black BG
@@ -701,7 +969,8 @@ mod tests {
             ..Default::default()
         };
         let res_black = process_image_bytes(&image_bytes, &opts_black).expect("Failed black");
-        fs::write("visual_test_contain_black.avif", res_black.avif_file).expect("Write failed");
+        let avif_black = encode_avif_image(&res_black, opts_black.quality).expect("Failed to encode AVIF");
+        fs::write("visual_test_contain_black.avif", avif_black).expect("Write failed");
         println!("Generated visual_test_contain_black.avif");
 
         // Case 3: 1280x960, Contain, Red BG (Hex)
@@ -713,7 +982,8 @@ mod tests {
             ..Default::default()
         };
         let res_red = process_image_bytes(&image_bytes, &opts_red).expect("Failed red");
-        fs::write("visual_test_contain_red.avif", res_red.avif_file).expect("Write failed");
+        let avif_red = encode_avif_image(&res_red, opts_red.quality).expect("Failed to encode AVIF");
+        fs::write("visual_test_contain_red.avif", avif_red).expect("Write failed");
         println!("Generated visual_test_contain_red.avif");
 
         // Case 4: 1280x960, Cover
@@ -724,7 +994,8 @@ mod tests {
             ..Default::default()
         };
         let res_cover = process_image_bytes(&image_bytes, &opts_cover).expect("Failed cover");
-        fs::write("visual_test_cover.avif", res_cover.avif_file).expect("Write failed");
+        let avif_cover = encode_avif_image(&res_cover, opts_cover.quality).expect("Failed to encode AVIF");
+        fs::write("visual_test_cover.avif", avif_cover).expect("Write failed");
         println!("Generated visual_test_cover.avif");
 
         // --- Pattern Tests ---
@@ -742,7 +1013,8 @@ mod tests {
             ..Default::default()
         };
         let res_checker = process_image_bytes(&image_bytes, &opts_checker).expect("Failed checker");
-        fs::write("visual_test_pattern_checker.avif", res_checker.avif_file).expect("Write failed");
+        let avif_checker = encode_avif_image(&res_checker, opts_checker.quality).expect("Failed to encode AVIF");
+        fs::write("visual_test_pattern_checker.avif", avif_checker).expect("Write failed");
         println!("Generated pattern_checker.png & visual_test_pattern_checker.avif");
 
         // 2. Stripes (Blue/White)
@@ -758,7 +1030,8 @@ mod tests {
             ..Default::default()
         };
         let res_stripes = process_image_bytes(&image_bytes, &opts_stripes).expect("Failed stripes");
-        fs::write("visual_test_pattern_stripe.avif", res_stripes.avif_file).expect("Write failed");
+        let avif_stripes = encode_avif_image(&res_stripes, opts_stripes.quality).expect("Failed to encode AVIF");
+        fs::write("visual_test_pattern_stripe.avif", avif_stripes).expect("Write failed");
         println!("Generated pattern_stripe.png & visual_test_pattern_stripe.avif");
 
         // 3. Dots (Pink/White)
@@ -774,7 +1047,8 @@ mod tests {
             ..Default::default()
         };
         let res_dots = process_image_bytes(&image_bytes, &opts_dots).expect("Failed dots");
-        fs::write("visual_test_pattern_dot.avif", res_dots.avif_file).expect("Write failed");
+        let avif_dots = encode_avif_image(&res_dots, opts_dots.quality).expect("Failed to encode AVIF");
+        fs::write("visual_test_pattern_dot.avif", avif_dots).expect("Write failed");
         println!("Generated pattern_dot.png & visual_test_pattern_dot.avif");
     }
 }

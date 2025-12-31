@@ -31,15 +31,18 @@ Provide a stateless image compression and resizing service for internal use, pro
   - `fit` (`contain`, `cover`, `fill`)
   - `bg` (named color or hex)
   - `pattern` (pattern image URL)
-  - `quality` (1-100, default 80)
+  - `ext` (`avif`, `jpg`, `jpeg`, `png`, default `avif`; overrides `Accept`)
+  - `quality` (1-100, default 80; PNG maps to compression hints)
+  - `Accept` header (exact `image/avif`, `image/jpeg`, `image/png` when `ext` is omitted)
 
 ## Core workflows
-- Convert: fetch -> decode -> EXIF orientation -> crop -> resize/fit -> background/pattern -> AVIF encode -> respond.
+- Convert: fetch -> decode -> EXIF orientation -> crop -> resize/fit -> background/pattern -> encode (AVIF/JPEG/PNG) -> respond.
 - Crop: clamp to bounds; normalized values are relative to oriented image size.
 - Contain: pad to target size with color or tiled pattern.
+- JPEG output: if transparency remains and `bg` is missing, fall back to PNG to preserve alpha.
 
 ## Data model (conceptual)
-Stateless; no DB. All inputs are query params and remote image bytes; outputs are AVIF bytes.
+Stateless; no DB. All inputs are query params and remote image bytes; outputs are AVIF/JPEG/PNG bytes.
 
 ## Non-functional requirements
 - Performance: Lanczos3 resize; ravif speed 6; no caching.
