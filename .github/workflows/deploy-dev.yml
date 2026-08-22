@@ -1,0 +1,43 @@
+# deploy-dev.yml — image-optimizer dev fabric caller (oq-devops spec 089).
+#
+# 왜 생겼나: 이 리포에는 `.github/workflows` 디렉터리 자체가 없었다. dev·prod 모두
+# 운영자가 로컬에서 `oq deploy` 를 직접 쳐서 올렸고, 그래서 라이브가 어느 커밋인지
+# 기록이 없다(dev·prod 모두 2026-05-22 이미지에 3개월째 멈춰 있다).
+# spec 089 가 v2 배포기(oq-devops/deploy-services.yaml)를 폐기하기 전에 이 경로를
+# 먼저 만든다 — 배포 수단을 먼저 만들고 옛 수단을 없앤다(spec 089 불변식 I-3).
+#
+# 서비스 이름: v3 매니페스트 name=image-optimizer → Cloud Run `oqrun-{env}-image-optimizer`.
+# 매니페스트의 service_name(oq-image-optimizer)은 **AR 이미지 이름**이지 Cloud Run 이름이 아니다.
+name: Deploy to dev
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+      - ".dockerignore"
+      - "*.png"
+  workflow_dispatch:
+    inputs:
+      env: { type: choice, options: [dev], default: dev }
+
+permissions: { id-token: write, contents: read }
+
+concurrency: { group: deploy-dev, cancel-in-progress: false }
+
+jobs:
+  deploy:
+    uses: qo-kr/.github/.github/workflows/deploy-shared.yml@main
+    with:
+      service:     image-optimizer
+      env:         dev
+      adapter:     v3
+      org:         qo-kr
+      ar_path:     asia-northeast3-docker.pkg.dev/oqoqai/oq-image-optimizer-dev/oq-image-optimizer
+      runtime_sa:  oqsa-dev-main@oqoqai.iam.gserviceaccount.com
+      dockerfile:  ./Dockerfile
+      build_label: '["self-hosted","Linux","X64","oqhost"]'
+    secrets:
+      gcp_wif_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+      gcp_sa_email:     ${{ secrets.GCP_SA_EMAIL }}
