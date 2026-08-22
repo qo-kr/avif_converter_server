@@ -28,7 +28,11 @@ concurrency: { group: deploy-dev, cancel-in-progress: false }
 
 jobs:
   deploy:
-    uses: qo-kr/.github/.github/workflows/deploy-shared.yml@main
+    # ⚠️ `uses:` 는 버전 태그로 고정한다 — `@main` 금지(#948). `@main` 이면 공용
+    # 워크플로에 커밋 하나만 들어가도 이 리포의 배포 동작이 즉시 바뀌고, 이 리포의
+    # git 이력에는 아무 단서가 남지 않는다. 현재 태그는 oq-devops
+    # `v3/cicd/deploy-shared.version` 참조.
+    uses: qo-kr/.github/.github/workflows/deploy-shared.yml@deploy-shared-v1.0.0
     with:
       service:     image-optimizer
       env:         dev
