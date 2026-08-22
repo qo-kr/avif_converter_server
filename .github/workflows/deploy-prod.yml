@@ -35,7 +35,14 @@ jobs:
       ar_path:     asia-northeast3-docker.pkg.dev/oqoqai/oq-image-optimizer-prod/oq-image-optimizer
       runtime_sa:  oqsa-prod-main@oqoqai.iam.gserviceaccount.com
       dockerfile:  ./Dockerfile
-      build_label: '["self-hosted","Linux","X64","oqhost"]'
+      # 🔎 이 리포는 **public fork** 다(qo-kr/avif_converter_server, upstream adgsenpai/…).
+      # 그래서 조직 self-hosted 러너(oqhost)를 쓸 수 없다 — 조직 러너 그룹 Default 가
+      # `allows_public_repositories=false` 이고, 그건 켜면 안 되는 스위치다(public repo 의
+      # fork PR 이 운영자 개인 머신에서 임의 코드를 돌릴 수 있게 된다).
+      # 대신 GitHub-hosted 를 쓴다 — **public repo 는 Actions 분수가 무료**라 예산 문제도 없다.
+      # (실증: 이 리포의 2026-05-22 "Fly Deploy" 런이 ubuntu-latest 에서 정상 시작했다.)
+      # 빌드가 GitHub-hosted 에서 실패하면 deploy-shared 가 Cloud Build 로 자동 폴백한다.
+      build_label: '["ubuntu-latest"]'
     secrets:
       gcp_wif_provider: ${{ secrets.GCP_WIF_PROVIDER }}
       gcp_sa_email:     ${{ secrets.GCP_SA_EMAIL_PROD }}
