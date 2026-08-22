@@ -1,0 +1,117 @@
+name: Notify deploy pending
+
+# main 에 머지됐는데 prod 반영은 수동 dispatch("Deploy to prod")라, 그 사이가 아무 신호 없는
+# 사각지대다. 2026-08-21 실제로 OQ 가 5커밋(코드 114파일) 대기 상태였는데 아무도 몰랐고,
+# oq-api 도 3주치 릴리스가 머지된 채 하루 가까이 미배포로 남아 있었다.
+# 이 워크플로는 그 상태를 머지 직후 Slack 으로 알린다.
+#
+# 판정 방법: 마지막으로 **성공한** deploy-prod.yml 런의 head_sha 와 현재 main HEAD 를 비교한다.
+#   - Cloud Run 을 조회하지 않으므로 GCP 인증이 전혀 필요 없다(WIF·시크릿 0).
+#   - 라이브 이미지 태그(<run_id>-<attempt>)의 근원이 곧 그 런이라 결과는 동일하다.
+#
+# 알림 자체가 릴리스를 막으면 안 되므로 어떤 실패도 워크플로를 빨갛게 만들지 않는다.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "specs/**"
+      - ".specify/**"
+      - ".claude/**"
+      - "**.md"
+      - ".gitignore"
+      - ".dockerignore"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: notify-deploy-pending
+  cancel-in-progress: true
+
+jobs:
+  notify:
+    # 🔎 이 리포는 **public fork** 다(qo-kr/avif_converter_server, upstream adgsenpai/…).
+    # 그래서 조직 self-hosted 러너(oqhost)를 쓸 수 없다 — 조직 러너 그룹 Default 가
+    # `allows_public_repositories=false` 이고, 그건 켜면 안 되는 스위치다(public repo 의
+    # fork PR 이 운영자 개인 머신에서 임의 코드를 돌릴 수 있게 된다).
+    # 대신 GitHub-hosted 를 쓴다 — **public repo 는 Actions 분수가 무료**라 예산 문제도 없다.
+    # (실증: 이 리포의 2026-05-22 "Fly Deploy" 런이 ubuntu-latest 에서 정상 시작했다.)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report pending prod deploy
+        env:
+          GH_API_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SVC_LABEL: image-optimizer
+        run: |
+          set -uo pipefail
+          API="${GITHUB_API_URL:-https://api.github.com}"
+          REPO="${GITHUB_REPOSITORY}"
+          gh_get() { curl -sS -H "Authorization: Bearer $GH_API_TOKEN" \
+                       -H "Accept: application/vnd.github+json" --max-time 25 "$1"; }
+
+          HEAD_SHA="${GITHUB_SHA}"
+
+          # 마지막 성공 prod 배포 런
+          LAST=$(gh_get "$API/repos/$REPO/actions/workflows/deploy-prod.yml/runs?status=success&per_page=1" \
+                 | jq -r '.workflow_runs[0].head_sha // ""')
+          if [ -z "$LAST" ]; then
+            echo "::notice::성공한 deploy-prod 런이 없어 비교 기준이 없다 — 알림 생략"
+            exit 0
+          fi
+          if [ "$LAST" = "$HEAD_SHA" ]; then
+            echo "main HEAD 가 이미 배포됨(${HEAD_SHA:0:8}) — 알림 생략"
+            exit 0
+          fi
+
+          CMP=$(gh_get "$API/repos/$REPO/compare/$LAST...$HEAD_SHA")
+          N=$(jq -r '.total_commits // 0' <<<"$CMP")
+          [ "$N" -eq 0 ] && { echo "대기 커밋 0 — 알림 생략"; exit 0; }
+
+          # 문서/스펙만 바뀐 대기분은 굳이 배포를 재촉할 필요가 없다.
+          CODE_N=$(jq -r '[.files[]?.filename
+                    | select(test("^(docs/|specs/|\\.specify/|\\.claude/)")|not)
+                    | select(test("\\.md$")|not)] | length' <<<"$CMP")
+
+          LIST=$(jq -r '[.commits[] | "• `" + .sha[0:8] + "` " + (.commit.message|split("\n")[0])]
+                        | reverse | .[0:6] | join("\n")' <<<"$CMP")
+          [ "$N" -gt 6 ] && LIST="$LIST"$'\n'"…외 $((N-6))건"
+
+          DISPATCH="${GITHUB_SERVER_URL}/$REPO/actions/workflows/deploy-prod.yml"
+          CMP_URL="${GITHUB_SERVER_URL}/$REPO/compare/${LAST:0:8}...${HEAD_SHA:0:8}"
+
+          if [ "$CODE_N" -eq 0 ]; then
+            HEAD_TXT="📄 ${SVC_LABEL} — prod 배포 대기 ${N}커밋 (문서만)"
+            COLOR="#8b98a5"
+          else
+            HEAD_TXT="⏳ ${SVC_LABEL} — prod 배포 대기 ${N}커밋 (코드 ${CODE_N}파일)"
+            COLOR="#eab308"
+          fi
+
+          echo "$HEAD_TXT"
+          [ -z "${SLACK_WEBHOOK:-}" ] && { echo "::warning::SLACK_WEBHOOK_URL 미설정 — Slack 생략"; exit 0; }
+
+          PAYLOAD=$(jq -n \
+            --arg color "$COLOR" --arg head "$HEAD_TXT" --arg list "$LIST" \
+            --arg last "${LAST:0:8}" --arg cmp "$CMP_URL" --arg disp "$DISPATCH" \
+            '{attachments:[{color:$color, blocks:[
+               {type:"section", text:{type:"mrkdwn", text:$head}},
+               {type:"section", text:{type:"mrkdwn", text:$list}},
+               {type:"context", elements:[{type:"mrkdwn",
+                 text:("마지막 prod 배포 `"+$last+"` · <"+$cmp+"|변경 비교> · <"+$disp+"|▶ Deploy to prod 실행>")}]}
+             ]}]}')
+
+          # curl 은 HTTP 4xx 에도 종료코드 0 이라, 본문("ok")까지 봐야 도착을 안다.
+          # (이 검증이 없어서 배포 카드가 한 번도 안 갔는데 로그는 계속 'sent' 였다 — 2026-08-21)
+          RESP=$(curl -sS -X POST -H 'Content-type: application/json' \
+                   --data "$PAYLOAD" -w '\n%{http_code}' --max-time 20 "$SLACK_WEBHOOK" 2>&1) || true
+          CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+          if [ "$CODE" = "200" ] && [ "$BODY" = "ok" ]; then
+            echo "slack sent (배포 대기)"
+          else
+            echo "::warning::Slack 전송 실패 — http=${CODE} resp=$(echo "$BODY" | head -c 200)"
+          fi

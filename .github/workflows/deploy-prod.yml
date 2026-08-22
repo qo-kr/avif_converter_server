@@ -1,0 +1,48 @@
+# deploy-prod.yml — image-optimizer PROD fabric caller (oq-devops spec 089).
+#
+# 트리거 = workflow_dispatch 전용(spec 083 규약). main 머지는 "배포 대기" 알림만 띄우고
+# prod 반영은 사람이 누른다.
+#
+# ⚠ minScale 주의: 이 서비스는 cloudrun-scaler 가 Cloud Scheduler 로 minScale 을
+#   매일 뒤집는다(09시 →1, 23시 →0). 그래서 v3 매니페스트의 resources.prod 에는
+#   min_instances 키가 **없다**(spec 089 FR-010/I-8) — 배포가 스케일러 의도를
+#   덮지 않게 하기 위해서다. 매니페스트에 그 키를 되살리지 말 것.
+name: Deploy to prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      env: { type: choice, options: [prod], default: prod }
+
+permissions: { id-token: write, contents: read }
+
+concurrency: { group: deploy-prod, cancel-in-progress: false }
+
+jobs:
+  deploy:
+    # 🔒 prod 는 main 에서만 배포(fail-closed).
+    if: ${{ github.ref == 'refs/heads/main' }}
+    # ⚠️ `uses:` 는 버전 태그로 고정한다 — `@main` 금지(#948). `@main` 이면 공용
+    # 워크플로에 커밋 하나만 들어가도 이 리포의 배포 동작이 즉시 바뀌고, 이 리포의
+    # git 이력에는 아무 단서가 남지 않는다. 현재 태그는 oq-devops
+    # `v3/cicd/deploy-shared.version` 참조.
+    uses: qo-kr/.github/.github/workflows/deploy-shared.yml@deploy-shared-v1.0.0
+    with:
+      service:     image-optimizer
+      env:         prod
+      adapter:     v3
+      org:         qo-kr
+      ar_path:     asia-northeast3-docker.pkg.dev/oqoqai/oq-image-optimizer-prod/oq-image-optimizer
+      runtime_sa:  oqsa-prod-main@oqoqai.iam.gserviceaccount.com
+      dockerfile:  ./Dockerfile
+      # 🔎 이 리포는 **public fork** 다(qo-kr/avif_converter_server, upstream adgsenpai/…).
+      # 그래서 조직 self-hosted 러너(oqhost)를 쓸 수 없다 — 조직 러너 그룹 Default 가
+      # `allows_public_repositories=false` 이고, 그건 켜면 안 되는 스위치다(public repo 의
+      # fork PR 이 운영자 개인 머신에서 임의 코드를 돌릴 수 있게 된다).
+      # 대신 GitHub-hosted 를 쓴다 — **public repo 는 Actions 분수가 무료**라 예산 문제도 없다.
+      # (실증: 이 리포의 2026-05-22 "Fly Deploy" 런이 ubuntu-latest 에서 정상 시작했다.)
+      # 빌드가 GitHub-hosted 에서 실패하면 deploy-shared 가 Cloud Build 로 자동 폴백한다.
+      build_label: '["ubuntu-latest"]'
+    secrets:
+      gcp_wif_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+      gcp_sa_email:     ${{ secrets.GCP_SA_EMAIL_PROD }}
