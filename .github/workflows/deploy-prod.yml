@@ -1,0 +1,37 @@
+# deploy-prod.yml — image-optimizer PROD fabric caller (oq-devops spec 089).
+#
+# 트리거 = workflow_dispatch 전용(spec 083 규약). main 머지는 "배포 대기" 알림만 띄우고
+# prod 반영은 사람이 누른다.
+#
+# ⚠ minScale 주의: 이 서비스는 cloudrun-scaler 가 Cloud Scheduler 로 minScale 을
+#   매일 뒤집는다(09시 →1, 23시 →0). 그래서 v3 매니페스트의 resources.prod 에는
+#   min_instances 키가 **없다**(spec 089 FR-010/I-8) — 배포가 스케일러 의도를
+#   덮지 않게 하기 위해서다. 매니페스트에 그 키를 되살리지 말 것.
+name: Deploy to prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      env: { type: choice, options: [prod], default: prod }
+
+permissions: { id-token: write, contents: read }
+
+concurrency: { group: deploy-prod, cancel-in-progress: false }
+
+jobs:
+  deploy:
+    # 🔒 prod 는 main 에서만 배포(fail-closed).
+    if: ${{ github.ref == 'refs/heads/main' }}
+    uses: qo-kr/.github/.github/workflows/deploy-shared.yml@main
+    with:
+      service:     image-optimizer
+      env:         prod
+      adapter:     v3
+      org:         qo-kr
+      ar_path:     asia-northeast3-docker.pkg.dev/oqoqai/oq-image-optimizer-prod/oq-image-optimizer
+      runtime_sa:  oqsa-prod-main@oqoqai.iam.gserviceaccount.com
+      dockerfile:  ./Dockerfile
+      build_label: '["self-hosted","Linux","X64","oqhost"]'
+    secrets:
+      gcp_wif_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+      gcp_sa_email:     ${{ secrets.GCP_SA_EMAIL_PROD }}
